@@ -265,12 +265,12 @@ int main(int argc, char **argv) {
     /* TODO: Pick device */
     /* strcpy(nl.wiphy_name, "phy3"); */
     /* nl.wiphy_idx = 3; */
-    strcpy(nl.if_name, "monrs0");
+    strcpy(nl.if_name, "wlan0mon");
 
     /* see if interface exists already */
     netlink_client_command_init(&cmd, &nl, NL80211_CMD_GET_INTERFACE,
                                 NLM_F_DUMP, callback_get_interface);
-    int exists;
+    int exists = 0;
     cmd.ret = &exists;
     netlink_client_command_run(&cmd);
     if (!exists) {
