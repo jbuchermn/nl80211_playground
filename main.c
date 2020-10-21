@@ -19,24 +19,34 @@ struct netlink_client {
     int id;
     struct nl_sock *socket;
     struct nl_cb *cb;
-    int cb_in_prog;
 
-    /* Name of physical device */
-    int wiphy_idx;
+    /* Name and index of physical device */
+    uint32_t wiphy_idx;
     char wiphy_name[30];
-    /* Name of interface of type monitor */
+
+    /* Name and index of interface of type monitor */
+    uint32_t if_index;
     char if_name[30];
 };
 
-static int callback_finish(struct nl_msg *msg, void *arg) {
-    struct netlink_client *nl = arg;
+struct netlink_client_command {
+    struct netlink_client *root;
 
-    nl->cb_in_prog = 0;
+    int cb_in_progress;
+    struct nl_msg *msg;
+
+    void *ret;
+};
+
+static int callback_finish(struct nl_msg *msg, void *arg) {
+    struct netlink_client_command *cmd = arg;
+
+    cmd->cb_in_progress = 0;
     return NL_OK;
 }
 
 static int callback_get_wiphy(struct nl_msg *msg, void *arg) {
-    struct netlink_client *nl = arg;
+    struct netlink_client_command *cmd = arg;
     /* nl_msg_dump(msg, stdout); */
 
     struct genlmsghdr *genlh = nlmsg_data(nlmsg_hdr(msg));
@@ -56,30 +66,60 @@ static int callback_get_wiphy(struct nl_msg *msg, void *arg) {
         }
     }
     if (supports_monitor_mode) {
-        strcpy(nl->wiphy_name, "");
-        nl->wiphy_idx=-1;
         if (tb_msg[NL80211_ATTR_WIPHY_NAME]) {
-            strcpy(nl->wiphy_name,
+            strcpy(cmd->root->wiphy_name,
                    nla_get_string(tb_msg[NL80211_ATTR_WIPHY_NAME]));
         }
         if (tb_msg[NL80211_ATTR_WIPHY]) {
-            nl->wiphy_idx = nla_get_u32(tb_msg[NL80211_ATTR_WIPHY]);
+            cmd->root->wiphy_idx = nla_get_u32(tb_msg[NL80211_ATTR_WIPHY]);
         }
         printf("Found device that supports monitor mode: %i / %s\n",
-               nl->wiphy_idx, nl->wiphy_name);
+               cmd->root->wiphy_idx, cmd->root->wiphy_name);
+    }
+
+    return NL_OK;
+}
+
+static int callback_get_interface(struct nl_msg *msg, void *arg) {
+    struct netlink_client_command *cmd = arg;
+    /* nl_msg_dump(msg, stdout); */
+
+    struct genlmsghdr *genlh = nlmsg_data(nlmsg_hdr(msg));
+    struct nlattr *tb_msg[NL80211_ATTR_MAX + 1];
+    nla_parse(tb_msg, NL80211_ATTR_MAX, genlmsg_attrdata(genlh, 0),
+              genlmsg_attrlen(genlh, 0), NULL);
+
+    if (tb_msg[NL80211_ATTR_IFNAME]) {
+        if (!strcmp(cmd->root->if_name,
+                    nla_get_string(tb_msg[NL80211_ATTR_IFNAME]))) {
+            *((int *)(cmd->ret)) = 1;
+            if (tb_msg[NL80211_ATTR_IFINDEX]) {
+                cmd->root->if_index = nla_get_u32(tb_msg[NL80211_ATTR_IFINDEX]);
+            }
+        }
     }
 
     return NL_OK;
 }
 
 static int callback_new_interface(struct nl_msg *msg, void *arg) {
-    struct netlink_client *nl = arg;
-    nl_msg_dump(msg, stdout);
+    struct netlink_client_command *cmd = arg;
+    /* nl_msg_dump(msg, stdout); */
 
     struct genlmsghdr *genlh = nlmsg_data(nlmsg_hdr(msg));
     struct nlattr *tb_msg[NL80211_ATTR_MAX + 1];
     nla_parse(tb_msg, NL80211_ATTR_MAX, genlmsg_attrdata(genlh, 0),
               genlmsg_attrlen(genlh, 0), NULL);
+
+    if (tb_msg[NL80211_ATTR_IFINDEX]) {
+        cmd->root->if_index = nla_get_u32(tb_msg[NL80211_ATTR_IFNAME]);
+    }
+    return NL_OK;
+}
+
+static int callback_set_mode(struct nl_msg *msg, void *arg) {
+    struct netlink_client_command *cmd = arg;
+    nl_msg_dump(msg, stdout);
 
     return NL_OK;
 }
@@ -116,8 +156,6 @@ static int netlink_client_init(struct netlink_client *nl) {
         return -ENOMEM;
     }
 
-    nl_cb_set(nl->cb, NL_CB_FINISH, NL_CB_CUSTOM, callback_finish, nl);
-    nl_cb_set(nl->cb, NL_CB_ACK, NL_CB_CUSTOM, callback_finish, nl);
     nl_cb_err(nl->cb, NL_CB_VERBOSE, NULL, stderr);
 
     return 0;
@@ -129,8 +167,41 @@ static void netlink_client_destroy(struct netlink_client *nl) {
     nl_socket_free(nl->socket);
 }
 
+static int netlink_client_command_init(struct netlink_client_command *command,
+                                       struct netlink_client *root, int cmd,
+                                       int flags,
+                                       nl_recvmsg_msg_cb_t callback) {
+    command->root = root;
+    command->ret = 0;
+
+    nl_cb_set(root->cb, NL_CB_FINISH, NL_CB_CUSTOM, callback_finish, command);
+    nl_cb_set(root->cb, NL_CB_ACK, NL_CB_CUSTOM, callback_finish, command);
+    nl_cb_set(root->cb, NL_CB_VALID, NL_CB_CUSTOM, callback, command);
+
+    command->msg = nlmsg_alloc();
+    if (!command->msg) {
+        fprintf(stderr, "Failed to allocate netlink message.\n");
+        return -2;
+    }
+    genlmsg_put(command->msg, NL_AUTO_PORT, NL_AUTO_SEQ, root->id, 0, flags,
+                cmd, 0);
+    return 0;
+}
+
+static int netlink_client_command_run(struct netlink_client_command *command) {
+    nl_send_auto_complete(command->root->socket, command->msg);
+    command->cb_in_progress = 1;
+    while (command->cb_in_progress) {
+        nl_recvmsgs(command->root->socket, command->root->cb);
+    }
+    nlmsg_free(command->msg);
+
+    return 0;
+}
+
 int main(int argc, char **argv) {
     struct netlink_client nl;
+    struct netlink_client_command cmd;
 
     /* signal(SIGINT, ctrl_c_handler); */
 
@@ -139,59 +210,46 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    /* Look for device with monitor mode */
-    {
-        nl_cb_set(nl.cb, NL_CB_VALID, NL_CB_CUSTOM, callback_get_wiphy, &nl);
-        struct nl_msg *msg = nlmsg_alloc();
-        if (!msg) {
-            fprintf(stderr, "Failed to allocate netlink message.\n");
-            return -2;
-        }
+    /* look for monitor-capable devices */
+    netlink_client_command_init(&cmd, &nl, NL80211_CMD_GET_WIPHY, NLM_F_DUMP,
+                                callback_get_wiphy);
+    netlink_client_command_run(&cmd);
 
-        genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, nl.id, 0, NLM_F_DUMP,
-                    NL80211_CMD_GET_WIPHY, 0);
-        nl_send_auto_complete(nl.socket, msg);
+    /* TODO: Pick device */
+    /* strcpy(nl.wiphy_name, "phy3"); */
+    /* nl.wiphy_idx = 3; */
+    strcpy(nl.if_name, "monrs0");
 
-        nl.cb_in_prog = 1;
-        while (nl.cb_in_prog) {
-            nl_recvmsgs(nl.socket, nl.cb);
-        }
-        nlmsg_free(msg);
+    /* see if interface exists already */
+    netlink_client_command_init(&cmd, &nl, NL80211_CMD_GET_INTERFACE,
+                                NLM_F_DUMP, callback_get_interface);
+    int exists;
+    cmd.ret = &exists;
+    netlink_client_command_run(&cmd);
+    if (!exists) {
+        printf("Interface '%s' does not yet exist, creating it...\n",
+               nl.if_name);
+        /* create monitor interface */
+        netlink_client_command_init(&cmd, &nl, NL80211_CMD_NEW_INTERFACE, 0,
+                                    callback_new_interface);
+        nla_put_u32(cmd.msg, NL80211_ATTR_WIPHY, nl.wiphy_idx);
+        nla_put_string(cmd.msg, NL80211_ATTR_IFNAME, nl.if_name);
+        nla_put_u32(cmd.msg, NL80211_ATTR_IFTYPE, NL80211_IFTYPE_MONITOR);
+        netlink_client_command_run(&cmd);
+
+        printf("...done\n");
+    } else {
+        printf("Interface '%s' exists, putting it in monitor mode...\n",
+               nl.if_name);
+
+        netlink_client_command_init(&cmd, &nl, NL80211_CMD_SET_INTERFACE, 0,
+                                    callback_set_mode);
+        nla_put_u32(cmd.msg, NL80211_ATTR_IFINDEX, nl.if_index);
+        nla_put_u32(cmd.msg, NL80211_ATTR_IFTYPE, NL80211_IFTYPE_MONITOR);
+        netlink_client_command_run(&cmd);
+        printf("...done\n");
     }
 
-    /* TODO: Break if no device */
-    strcpy(nl.if_name, "mon0");
-
-    /* create monitor interface */
-    {
-        nl_cb_set(nl.cb, NL_CB_VALID, NL_CB_CUSTOM, callback_new_interface,
-                  &nl);
-        struct nl_msg *msg = nlmsg_alloc();
-        if (!msg) {
-            fprintf(stderr, "Failed to allocate netlink message.\n");
-            return -2;
-        }
-
-        genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, nl.id, 0, NLM_F_DUMP,
-                    NL80211_CMD_NEW_INTERFACE, 0);
-
-        nla_put_u32(msg, NL80211_ATTR_WIPHY, nl.wiphy_idx);
-        nla_put_string(msg, NL80211_ATTR_IFNAME, nl.if_name);
-        nla_put_u32(msg, NL80211_ATTR_IFTYPE, NL80211_IFTYPE_MONITOR);
-
-
-        nl_msg_dump(msg, stderr);
-
-        nl_send_auto_complete(nl.socket, msg);
-
-        nl.cb_in_prog = 1;
-        while (nl.cb_in_prog) {
-            nl_recvmsgs(nl.socket, nl.cb);
-        }
-        nlmsg_free(msg);
-    }
-
-    printf("Exiting...\n");
     netlink_client_destroy(&nl);
     printf("...done\n");
     return 0;
