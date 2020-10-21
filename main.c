@@ -280,12 +280,14 @@ int main(int argc, char **argv) {
                                 callback_get_wiphy);
     netlink_client_command_run(&cmd);
 
-    /* TODO: Pick device */
-    strcpy(nl.wiphy_name, "phy3");
-    nl.wiphy_idx = 3;
+    /* TODO: If there are multiple choices pick device */
+    /* strcpy(nl.wiphy_name, "phy3"); */
+    /* nl.wiphy_idx = 3; */
+
     /* Depending on this name, either an existing interface is turned to monitor
-     * (works on raspbery with patched rtl8188eus) or a new interface is created
-     * aand other interfaces are deleted */
+     * (works on raspbery with patched rtl8188eus - deleting other interface causes
+     * a crash and adding a secondary monitor interface does not work) or a new
+     * interface is created aand other interfaces are deleted */
     strcpy(nl.if_name, "wlan0");
 
     /* see if interface exists already */
