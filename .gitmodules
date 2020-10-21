@@ -1,0 +1,3 @@
+[submodule "dependencies/radiotap-library"]
+	path = dependencies/radiotap-library
+	url = https://github.com/radiotap/radiotap-library

@@ -1,7 +1,7 @@
 [
   {
     "directory": ".",
-    "command": "gcc -Wall -g -O3 -I/usr/include/libnl3 -c main.c  -o main.o",
+    "command": "gcc -Wall -g -O3 -I/usr/include/libnl3 -Idependencies -c main.c  -o main.o",
     "file": "main.o"
   }
 ]
