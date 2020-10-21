@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -g -O3
 INCLUDES = -I/usr/include/libnl3 -Idependencies
 LFLAGS = 
-LIBS = $(shell pkg-config --libs libnl-genl-3.0 libpcap)
+LIBS = $(shell pkg-config --libs libnl-genl-3.0) -lpcap
 SRCS = main.c dependencies/radiotap-library/radiotap.c
 
 OBJS = $(SRCS:.c=.o)

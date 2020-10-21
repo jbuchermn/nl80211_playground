@@ -88,8 +88,15 @@ static int callback_get_wiphy(struct nl_msg *msg, void *arg) {
     return NL_OK;
 }
 
+struct get_interface_ret {
+    int exists;
+    uint32_t other_interfaces[20];
+    int n_other_interfaces;
+};
+
 static int callback_get_interface(struct nl_msg *msg, void *arg) {
     struct netlink_client_command *cmd = arg;
+    struct get_interface_ret *res = (struct get_interface_ret *)(cmd->ret);
     /* nl_msg_dump(msg, stdout); */
 
     struct genlmsghdr *genlh = nlmsg_data(nlmsg_hdr(msg));
@@ -97,12 +104,23 @@ static int callback_get_interface(struct nl_msg *msg, void *arg) {
     nla_parse(tb_msg, NL80211_ATTR_MAX, genlmsg_attrdata(genlh, 0),
               genlmsg_attrlen(genlh, 0), NULL);
 
-    if (tb_msg[NL80211_ATTR_IFNAME]) {
-        if (!strcmp(cmd->root->if_name,
-                    nla_get_string(tb_msg[NL80211_ATTR_IFNAME]))) {
-            *((int *)(cmd->ret)) = 1;
-            if (tb_msg[NL80211_ATTR_IFINDEX]) {
-                cmd->root->if_index = nla_get_u32(tb_msg[NL80211_ATTR_IFINDEX]);
+    if (tb_msg[NL80211_ATTR_WIPHY]) {
+        if (cmd->root->wiphy_idx == nla_get_u32(tb_msg[NL80211_ATTR_WIPHY])) {
+            if (tb_msg[NL80211_ATTR_IFNAME]) {
+                if (!strcmp(cmd->root->if_name,
+                            nla_get_string(tb_msg[NL80211_ATTR_IFNAME]))) {
+                    res->exists = 1;
+                    if (tb_msg[NL80211_ATTR_IFINDEX]) {
+                        cmd->root->if_index =
+                            nla_get_u32(tb_msg[NL80211_ATTR_IFINDEX]);
+                    }
+                } else {
+                    if (tb_msg[NL80211_ATTR_IFINDEX]) {
+                        res->other_interfaces[res->n_other_interfaces] =
+                            nla_get_u32(tb_msg[NL80211_ATTR_IFINDEX]);
+                        res->n_other_interfaces++;
+                    }
+                }
             }
         }
     }
@@ -263,19 +281,24 @@ int main(int argc, char **argv) {
     netlink_client_command_run(&cmd);
 
     /* TODO: Pick device */
-    /* strcpy(nl.wiphy_name, "phy3"); */
-    /* nl.wiphy_idx = 3; */
-    strcpy(nl.if_name, "wlan0mon");
+    strcpy(nl.wiphy_name, "phy3");
+    nl.wiphy_idx = 3;
+    /* Depending on this name, either an existing interface is turned to monitor
+     * (works on raspbery with patched rtl8188eus) or a new interface is created
+     * aand other interfaces are deleted */
+    strcpy(nl.if_name, "wlan0");
 
     /* see if interface exists already */
     netlink_client_command_init(&cmd, &nl, NL80211_CMD_GET_INTERFACE,
                                 NLM_F_DUMP, callback_get_interface);
-    int exists = 0;
-    cmd.ret = &exists;
+
+    struct get_interface_ret ret = { 0 };
+    cmd.ret = &ret;
     netlink_client_command_run(&cmd);
-    if (!exists) {
+    if (!ret.exists) {
         printf("Interface '%s' does not yet exist, creating it...\n",
                nl.if_name);
+
         /* create monitor interface */
         netlink_client_command_init(&cmd, &nl, NL80211_CMD_NEW_INTERFACE, 0,
                                     callback_new_interface);
@@ -289,6 +312,7 @@ int main(int argc, char **argv) {
         printf("Interface '%s' exists, putting it in monitor mode...\n",
                nl.if_name);
 
+        /* put it in monitor interface */
         netlink_client_command_init(&cmd, &nl, NL80211_CMD_SET_INTERFACE, 0,
                                     callback_set_mode);
         nla_put_u32(cmd.msg, NL80211_ATTR_IFINDEX, nl.if_index);
@@ -297,13 +321,19 @@ int main(int argc, char **argv) {
         printf("...done\n");
     }
 
-    netlink_client_destroy(&nl);
+    /* try and remove other interfaces */
+    for(int i=0; i<ret.n_other_interfaces; i++){
+        printf("Deleting unused interface %d on physical device '%s'...\n",
+                ret.other_interfaces[i], nl.wiphy_name);
 
-    int err;
-    char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t *pcap = pcap_create(nl.if_name, errbuf);
-    pcap_set_snaplen(pcap, -1);
-    pcap_set_timeout(pcap, -1);
+        netlink_client_command_init(&cmd, &nl, NL80211_CMD_DEL_INTERFACE, 0,
+                                    callback_set_mode);
+        nla_put_u32(cmd.msg, NL80211_ATTR_IFINDEX,ret.other_interfaces[i]);
+        netlink_client_command_run(&cmd);
+        printf("...done\n");
+    }
+
+    netlink_client_destroy(&nl);
 
     /*
      * ip link set ifname up
@@ -315,21 +345,29 @@ int main(int argc, char **argv) {
     fd = socket(PF_PACKET, SOCK_DGRAM, 0);
     if (fd < 0) {
         printf("Could not open up socket\n");
+        return -1;
     }
 
-    err = ioctl(fd, SIOCGIFFLAGS, &ifr);
-    if (err) {
+    if (ioctl(fd, SIOCGIFFLAGS, &ifr)) {
         printf("Error: SIOCGIFFLAGS\n");
         close(fd);
         return -1;
     }
     ifr.ifr_flags |= IFF_UP;
-    err = ioctl(fd, SIOCSIFFLAGS, &ifr);
-    if (err)
-        perror("SIOCSIFFLAGS");
+    if (ioctl(fd, SIOCSIFFLAGS, &ifr)){
+        printf("Error: SIOCGIFFLAGS\n");
+        close(fd);
+        return -1;
+    }
     close(fd);
 
     /* activate pcap */
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *pcap = pcap_create(nl.if_name, errbuf);
+    pcap_set_snaplen(pcap, -1);
+    pcap_set_timeout(pcap, -1);
+
+    int err;
     if ((err = pcap_activate(pcap)) != 0) {
         printf("PCAP activate failed: %d %d\n", err, PCAP_ERROR_IFACE_NOT_UP);
     } else if (pcap_setnonblock(pcap, 1, errbuf) != 0) {
@@ -361,7 +399,7 @@ int main(int argc, char **argv) {
     tx_ptr += sizeof(tx_ieee80211_header);
     tx_len -= sizeof(tx_ieee80211_header);
 
-    for (; tx_ptr - tx_buf < 256; tx_ptr++)
+    for (; tx_ptr - tx_buf < 512; tx_ptr++)
         *tx_ptr = 0xDD;
 
     for (;;) {
@@ -422,8 +460,11 @@ int main(int argc, char **argv) {
                 payload_len -= 4;
             }
 
-            printf("%d: %02x %02x %02x %02x\n", payload_len, *payload,
-                   *(payload + 1), *(payload + 2), *(payload + 3));
+            if (payload_len > 120)
+                printf("%d: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                       payload_len, *(payload + 110), *(payload + 111),
+                       *(payload + 112), *(payload + 113), *(payload + 114),
+                       *(payload + 115), *(payload + 116), *(payload + 117));
         }
     }
 
